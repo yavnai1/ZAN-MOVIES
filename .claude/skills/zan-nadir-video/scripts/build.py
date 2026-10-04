@@ -56,6 +56,45 @@ if not os.path.exists(clean):
           'loudnorm=I=-14:TP=-1.5:LRA=8,aresample=48000,pan=stereo|c0=c0|c1=c0')
     run([FF, '-v', 'error', '-y', '-ss', str(t0), '-t', str(D), '-i', video, '-vn', '-af', af, '-c:a', 'pcm_s16le', clean])
 
+# 1b) optional: cut silences (jump cuts), keeping word onsets/endings and breaths ----
+if cfg.get('cut_silences'):
+    tight = os.path.join(work, 'tight.mp4'); clean_t = os.path.join(work, 'clean_tight.wav')
+    if not os.path.exists(tight):
+        import numpy as np, wave
+        raw = subprocess.run([FF, '-v', 'error', '-i', clean, '-ac', '1', '-ar', '48000', '-f', 's16le', '-'], capture_output=True).stdout
+        x = np.frombuffer(raw, np.int16).astype(np.float32) / 32768
+        hop = 480; n = len(x) // hop
+        db = 20 * np.log10(np.sqrt((x[:n * hop].reshape(n, hop) ** 2).mean(1) + 1e-12))
+        db = np.convolve(db, np.ones(9) / 9, 'same'); thr = max(np.percentile(db, 25), -42)
+        quiet = db < thr; keep = []; cur = 0.0; i = 0
+        min_sil = cfg.get('min_silence', 0.35); pre, post = 0.12, 0.10   # never clip a word's tail or onset
+        while i < n:
+            if quiet[i]:
+                j = i
+                while j < n and quiet[j]: j += 1
+                if (j - i) / 100 >= min_sil:
+                    a, b = i / 100 + pre, j / 100 - post
+                    if b - a > 0.05:
+                        if a > cur: keep.append((cur, a))
+                        cur = b
+                i = j
+            else: i += 1
+        if cur < D: keep.append((cur, D))
+        keep = [(round(a, 3), round(b, 3)) for a, b in keep if b - a > 0.15]
+        json.dump(keep, open(os.path.join(work, 'edl.json'), 'w'))
+        # audio: slice the cleaned track with 10ms fades at every join (no clicks)
+        sr = 48000; f = int(0.010 * sr); parts = []
+        for a, b in keep:
+            seg = x[int(a * sr):int(b * sr)].copy(); seg[:f] *= np.linspace(0, 1, f); seg[-f:] *= np.linspace(1, 0, f); parts.append(seg)
+        y = (np.clip(np.concatenate(parts), -1, 1) * 32767).astype(np.int16)
+        w = wave.open(clean_t, 'wb'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(y.tobytes()); w.close()
+        fc = ''.join(f'[0:v]trim={t0 + a}:{t0 + b},setpts=PTS-STARTPTS[v{k}];' for k, (a, b) in enumerate(keep))
+        fc += ''.join(f'[v{k}]' for k in range(len(keep))) + f'concat=n={len(keep)}:v=1:a=0[v]'
+        run([FF, '-v', 'error', '-y', '-i', video, '-filter_complex', fc, '-map', '[v]', '-c:v', 'libx264', '-crf', '14', '-preset', 'fast', tight])
+        print(f'silence cut: kept {sum(b - a for a, b in keep):.1f}s of {D:.1f}s in {len(keep)} pieces')
+    video, clean, t0 = tight, clean_t, 0
+    D = round(sum(b - a for a, b in json.load(open(os.path.join(work, 'edl.json')))), 3)
+
 # 2) word timing (whisper) + 3) align the user's transcript -------------------
 words = os.path.join(work, 'words.json')
 if not os.path.exists(words):
@@ -100,7 +139,18 @@ mc = cfg.get('map_card', [6.0, 11.5])
 if mc: ev.append(('map', mc[0], mc[1], True))
 for f in cfg.get('facts', []):
     a = f['start'] if 'start' in f else find_time(f['anchor'])
-    ev.append(('fact', a, min(a + f.get('dur', 4.5), D), f))
+    end = min(a + f.get('dur', 4.5), D)
+    c = f.get('count')   # count-up: {"from":0,"to":10,"dur":1.0}; "{n}" in title is replaced
+    if c:
+        steps = max(8, int(c.get('dur', 1.0) / 0.05)); cd = c.get('dur', 1.0)
+        for i in range(steps):
+            u = (i + 1) / steps; e_ = 1 - (1 - u) ** 3
+            val = c['from'] + (c['to'] - c['from']) * e_
+            txt = f"{val:.{c.get('decimals', 0)}f}"
+            ev.append(('fact', a + cd * i / steps, a + cd * (i + 1) / steps, {**f, 'title': f['title'].replace('{n}', txt)}))
+        ev.append(('fact', a + cd, end, {**f, 'title': f['title'].replace('{n}', f"{c['to']:.{c.get('decimals', 0)}f}")}))
+    else:
+        ev.append(('fact', a, end, f))
 for s in subs: ev.append(('sub', s['s'], s['e'], s['t']))
 # the map card and fact cards share a slot: facts win, map card is cut short
 cuts = sorted({0, D} | {max(0, min(e[1], D)) for e in ev} | {max(0, min(e[2], D)) for e in ev})
